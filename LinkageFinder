@@ -1,0 +1,665 @@
+library( tcltk )
+library( lattice )
+library( grid )
+
+options(warn=-1)
+
+## R script front-end for printing the output of the linkage analysis.
+
+kPaste <- function( ... ) { paste( ..., sep = "" ) }
+lu <- function( ... ) { length( unique( ... ) ) }
+
+set.seed(123)
+
+whereAmI <- tclvalue( tkchooseDirectory(
+  title="Please point to the directory where you would like your output files to be generated.\nIt is best to select a new, empty directory."
+  ) )
+
+if( substr( whereAmI, nchar(whereAmI), nchar(whereAmI) ) != "/" ) {
+  whereAmI <- kPaste( whereAmI, "/" )
+  }
+  
+dir.create( whereAmI, showWarnings = FALSE )
+  
+cat( "Please select the file(s) containing data output from your SGA readings:\n\n" )
+
+theData <- tk_choose.files(
+  caption="Please select the file(s) containing data output from your SGA readings"
+  )
+
+if( length( theData ) < 1 ) {
+  stop( kPaste("No files found in ", theData, "." ) )
+}
+
+cat( "Files read:\n\n" )
+for( p in 1:length(theData) ) {
+  cat( theData[p] )
+  cat( "\n" )
+  }
+  
+cat("\n----------\n\n")
+
+## Copy the raw data files to the directory to be used
+
+dir.create( kPaste( whereAmI, "rawData" ), recursive = TRUE, showWarnings = FALSE )
+
+datNames <- gsub( "[\\.]\\w{1,}", "", theData )
+datNames <- gsub( ".*[/\\]", "", datNames )
+
+linkageRegions <- vector( "list", length(datNames) )
+madTuners <- rep( 0, length(datNames) )
+
+for( i in 1:length(datNames) ) {
+
+  cat( kPaste( "On which chromosome*arm(s) do you wish to explore for linkage for dataset:\n",
+    datNames[i], "\n\nInput the systematic name(s) where you expective to find putative linkage \n (eg. query gene). Separate with a single space. \nEg: YCL016C YCR016C\n" ) )
+  linkageRegions[[i]] <- scan(what="character", nlines = 1)
+  linkageRegions[[i]] <- substring( linkageRegions[[i]], 2, 3 )
+  
+  cat( kPaste( "What value of madTuner do you wish to use for this SGA data set?\n\nLarger values of madTuner -> stricter cutoffs. madTuner = 4 is recommended for a first run.\n\n" ) )
+  
+  madTuners[i] <- scan( nmax = 1)
+  
+  cat("\n\n")
+  
+  }
+
+names( linkageRegions ) <- datNames
+
+cat( "\nCode running - please wait a moment...\n" )
+
+linkageRegions <- lapply( linkageRegions, function(x) { kPaste( "Arm: ", substr(x,2,2), ", Chromosome: ", substr(x,1,1) ) } )
+
+## --- PARAMETERS INVOLVED IN THE LOESS FITTING PROCESS --- ##
+
+## Sets a multiplier for the cutoff, specified against the MAD. Higher = more strict.
+## Input in same order as datNames / data entered above.
+
+## madTuners <- c(4,3.5,2,4)
+
+pValCutoff <- 0.05 ## denotes the cutoff p value for significance
+windowSize <- 31 ## denotes the size of a window.
+chromoArmWeight <- 0.5 ## Weigh the chromoArm median vs. the overall median
+nPseudo <- 0 ## Tune the number of pseudo-data points
+percentPseudo <- 0 ## Add / remove extra data for larger chromoArms?
+
+## Defines the minimum length of a region for it to be defined as linkage.
+## Helps to protect against 'edge' linkage which may not be actual linkage.
+
+minRegionLength <- 0
+
+## --- ADDITIONAL CONTROL PARAMETERS - touch only if you know what you're doing! --- #
+
+myDegree <- 2 ## 1 for linear, 2 for quadratic
+myFam <- "symm" ## alternate: symmetric kernel
+myIter <- 10 ## For robustness
+
+## --- MAIN BODY OF CODE --- ##
+##                           ##
+## ------------------------- ##
+
+dir.create( kPaste( whereAmI, "figs" ), showWarnings = FALSE )
+dir.create( kPaste( whereAmI, "outputData" ), showWarnings = FALSE )
+dir.create( kPaste( whereAmI, "dataSummary" ), showWarnings = FALSE )
+
+for( ii in 1:length(datNames) ) {
+  dir.create( kPaste( whereAmI, "figs/", datNames[ii] ), showWarnings = FALSE )
+  dir.create( kPaste( whereAmI, "outputData/", datNames[[ii]] ), showWarnings = FALSE )
+  }
+
+myData <- list()
+
+## Function for parsing ORF names into useful information
+
+parseORFname <- function( oNames ) {
+  chromoNum <- LETTERS[match( substr( oNames, 2, 2 ), LETTERS )]
+  arm <- substr( oNames, 3, 3 )
+  chArm <- kPaste( chromoNum, arm )
+  actDist <- as.numeric( substr( oNames, 4, 6 ) )
+  posRank <- as.numeric( gsub( "\\bY[A-P][LR]0*(\\d{1,3}).*","\\1", oNames, perl = TRUE ) )
+  ## posRankSigned <- ifelse( arm == "L", -1 * posRank, posRank )
+  return( data.frame( chromoNum, arm, posRank, actDist ) )
+  }
+
+for( ii in 1:length(theData) ) {
+
+  cDat <- read.csv( theData[ii] )
+  file.copy( theData[ii],
+             kPaste( whereAmI, "rawData/", datNames[ii], ".csv" )
+             )
+  names( cDat ) <- c("ORF","X.spots","X.0","EC","SE","Pval","Qval","Err.B","Err.T")
+
+  ## Remove non-standard ORF names for now.
+
+  cDat <- cDat[ grep( "Y", substr( cDat$ORF, 1, 1 ) ), ]
+  
+  ## Parse a distance from the ORF names
+
+  mDat <- cbind( cDat, parseORFname( cDat$ORF ) )
+
+  myData[[ii]] <- mDat
+  dir.create( kPaste( whereAmI, "cleanData" ), showWarnings=FALSE )
+  save( file = kPaste( whereAmI, "cleanData/", datNames[ii], ".Rdata" ), mDat )
+
+  }
+
+## Fit a smoother, and find regions of 'linkage'. That is, regions where the
+## smoother deviates below a certain value.
+
+for( i in 1:length(datNames) ) {
+
+  madTuner <- madTuners[i]
+  
+  theParams <- data.frame( windowSize, madTuner, chromoArmWeight, nPseudo, percentPseudo, minRegionLength )
+  theParams <- t( theParams )
+
+  load( kPaste( whereAmI, "cleanData/", datNames[i], ".Rdata" ) ) ## loads mDat
+
+  ## Remove NAs and extraneous info.
+
+  mDat <- mDat[ !is.na(mDat$EC ), ]
+
+  ## Get the loess fits, fit per group
+
+  mDat$gp <- as.numeric( as.factor( paste( mDat$chromoNum, mDat$arm ) ) )
+
+  minGp <- min( tapply( mDat$gp, mDat$gp, length ) )
+  maxGp <- max( tapply( mDat$gp, mDat$gp, length ) )
+
+  kDat <- EC.loess <- NULL
+
+  for( j in 1:lu(mDat$gp) ) {
+
+    tmp <- subset( mDat, mDat$gp == j )
+    tmp["dataType"] <- "Real"
+
+    ## Add some 'junk' data so that the smoother behaves better near the edges.
+
+    ## Define percentage of pseudodata to add to each side.
+
+    nPseudo <- ceiling( nPseudo + percentPseudo * nrow( tmp ) )
+
+    minPos <- min( tmp$posRank )
+    maxPos <- max( tmp$posRank )
+
+    lowerJunk <- data.frame(
+      ORF = "Junk",
+      X.spots = 1,
+      X.0 = 1,
+      SE = 1,
+      Pval = 1,
+      Qval = 1,
+      Err.B = 1,
+      Err.T = 1,
+      chromoNum = unique( tmp$chromoNum ),
+      arm = unique( tmp$arm ),
+      posRank = (minPos - nPseudo):(minPos-1),
+      gp = unique( tmp$gp ),
+      dataType = "Pseudo"
+      )
+
+    lowerJunk["actDist"] <- lowerJunk$posRank
+    ## lowerJunk["posRankSigned"] <- lowerJunk$posRank
+
+    lowerJunk["EC"] <- sample( tmp$EC, size = nrow(lowerJunk),
+      prob = seq( 0.8, 0.2, length.out = nrow( tmp ) ), replace = TRUE
+      )
+
+
+    upperJunk <- data.frame(
+      ORF = "Junk",
+      X.spots = 1,
+      X.0 = 1,
+      SE = 1,
+      Pval = 1,
+      Qval = 1,
+      Err.B = 1,
+      Err.T = 1,
+      chromoNum = unique( tmp$chromoNum ),
+      arm = unique( tmp$arm ),
+      posRank = (maxPos+1):(maxPos+nPseudo),
+      gp = unique( tmp$gp ),
+      dataType = "Pseudo"
+
+      )
+
+    upperJunk["actDist"] <- upperJunk$posRank
+    ## upperJunk["posRankSigned"] <- upperJunk$posRank
+
+    upperJunk["EC"] <- sample( tmp$EC, size = nrow(lowerJunk),
+      prob = seq( 0.2, 0.8, length.out = nrow( tmp ) ), replace = TRUE
+      )
+
+
+    tmp2 <- rbind( tmp, lowerJunk, upperJunk )
+
+    kSpan <- windowSize / nrow( tmp2 )
+
+    tmp3 <- with( tmp2,
+      loess( EC ~ posRank, span = kSpan, degree = myDegree, family = myFam, control = loess.control( iterations = myIter ) )
+      )
+
+    EC.loess <- fitted( tmp3 )
+
+    kDat <- rbind( kDat, cbind( tmp2, EC.loess ) )
+
+    }
+
+  ## Sort kDat's chromoNum and Arm first by arm, then by chromoNum.
+
+  kDat <- kDat[ order( kDat$arm ), ]
+  kDat$gpNice <- factor( kPaste( "Arm: ", kDat$arm, ", Chromosome: ", kDat$chromoNum ) )
+  kDat$gpNice2 <- factor( kPaste( kDat$arm, ":", kDat$chromoNum ) )
+  kDat$gp <- as.numeric( as.factor( kDat$gpNice ) )
+  
+  ## Define the boundary points for finding linkage.
+  ## oMedian is an acceptable middle.
+  ## oLower and oUpper define the lower and upper thresholds.
+
+  oMedian <- median( kDat$EC )
+  oMad <- mad( kDat$EC )
+
+  numPanels <- lu( kDat$gp )
+
+  pMedian <- with( kDat, tapply( EC, gp, median ) )
+  pMedian <- chromoArmWeight * pMedian + (1 - chromoArmWeight) * oMedian ## weighted combination
+  names( pMedian ) <- unique( kDat$gpNice )
+  pMad <- madTuner * oMad
+  
+  pUpper <- pMedian + pMad
+  pLower <- pMedian - pMad
+
+  myCutoff <- pLower
+  tCutoff <- NULL
+
+  for( j in 1:length(myCutoff) ) {
+    tCutoff <- c( tCutoff, rep( myCutoff[j],
+      times = nrow( kDat[ kDat$gp == j, ] ) ) )
+    }
+
+  kDat$myCutoff <- tCutoff
+
+  ## Evaluate different 'radiuses' in terms of the linkage region length found
+  ## on the linkage chromoArm
+  
+  for( jj in 1:length( linkageRegions[[ datNames[i] ]] ) ) {
+  
+    cRegion <- linkageRegions[[ datNames[i] ]][jj]
+    tmp <- kDat[ kDat$gpNice %in% cRegion & kDat$ORF != "Junk", ]
+    tmp <- tmp[ order( tmp$posRank ), ]
+    cArm <- as.character( unique( tmp$arm ) )
+    cChromoNum <- as.character( unique( tmp$chromoNum ) )
+    
+    ## minCutoff <- min( tmp$EC )
+    
+    cutoffRange <- seq(0, -1, by = -0.01)
+    linkageByCutoff <- vector("list", length(cutoffRange))
+    
+    ## Calculate some numbers for indexing the linkage regions
+   
+    for( k in 1:length(cutoffRange) ) {
+      
+      linkageCount <- 2
+      tmpCond <- tmp$EC.loess <= cutoffRange[k]
+      linkageByCutoff[[k]][1] <- as.numeric( tmpCond[1] ) + 1
+      
+      for( r in 2:nrow(tmp) ) {
+      
+        if( tmpCond[r] == TRUE & tmpCond[r-1] == FALSE ) {
+          linkageCount <- linkageCount + 1
+          }
+          
+        linkageByCutoff[[k]][r] <- linkageCount
+              
+        }
+        
+      linkageByCutoff[[k]][ !(tmp$EC.loess <= cutoffRange[k]) ] <- 1
+        
+      }
+      
+    names( linkageByCutoff ) <- cutoffRange 
+    
+    ## Plot number of linkage regions by cutoffRange
+    
+    numLinkageRegions <- lapply( linkageByCutoff, function(x) {
+      lu( names( table( x ) ) ) - 1
+      } )
+      
+    maxLinkageLength <- sapply( linkageByCutoff, function(x) {
+      tmp <- table( x )
+      ifelse( !is.na(tmp[2]), max( tmp[-1] ), 0 )
+      } )
+      
+    names( maxLinkageLength ) <- cutoffRange 
+    
+    ## Plot the number of linkage regions by madTuner
+    ## Translate the EC value into its corresponding madTuner value
+    ## EC.cutoff = pMedian - madTuner * oMad,
+    ## madTuner = (pMedian - EC.cutoff) / oMad
+    
+    madCutoff <- ( pMedian[ cRegion ] - cutoffRange ) / oMad  
+          
+    plot1 <- ( xyplot( numLinkageRegions ~ cutoffRange, type = "l",
+      main = kPaste("nRegions found on ", cRegion, " by EC cutoff"),
+      xlab = "EC cutoff chosen",
+      ylab = "Number of putative linkage regions",
+      ## sub = kPaste( "Window size chosen was ", windowSize )
+      ) )
+      
+    plot2 <- ( xyplot( maxLinkageLength ~ cutoffRange, type = "l",
+      main = kPaste("Length of the largest putative linkage region on ", cRegion ),
+      xlab = "EC cutoff chosen",
+      ylab = "Length of largest putative linkage region",
+      sub = kPaste( "Window size chosen was ", windowSize )
+      ) )
+      
+    plot3 <- ( xyplot( numLinkageRegions ~ madCutoff, type = "l",
+      main = kPaste("Number of putative linkage regions found on ", cRegion," by madTuner value"),
+      xlab = "madTuner value chosen",
+      ylab = "Number of putative linkage regions",
+      ## sub = kPaste( "Window size chosen was ", windowSize )
+      ) )
+      
+    plot4 <- ( xyplot( maxLinkageLength ~ madCutoff, type = "l",
+      main = "Length of the largest putative linkage region on this chromoArm",
+      xlab = "madTuner value chosen",
+      ylab = "Length of largest putative linkage region",
+      sub = kPaste( "Window size chosen was ", windowSize )
+      ) )
+      
+    pdf( kPaste( whereAmI, "figs/", datNames[i], "/NumPutativeLinkageRegionsByCutoff-arm",
+      cArm, "-chromoNum", cChromoNum, ".pdf" ),
+      height = 12, width = 12 )
+      
+    ## position: xmin, ymin, xmax, ymax
+      
+    plot( plot1, position = c(0, 0.5, 0.5, 1), more = TRUE )
+    plot( plot2, position = c(0, 0, 0.5, 0.5), more = TRUE )
+    plot( plot3, position = c(0.5, 0.5, 1, 1), more = TRUE )
+    plot( plot4, position = c(0.5, 0, 1, 0.5), more = FALSE )
+      
+    dev.off()
+         
+    ## Get some plots for 'null' linkage region statistics based on current
+    ## madTuner value
+    
+    tmp <- kDat[ !(kDat$gpNice %in% linkageRegions[[ datNames[i] ]]) & kDat$dataType == "Real", ]
+    
+    linkageByCutoff <- list()
+    linkageCount <- 2
+      
+    for( r in 2:nrow(tmp) ) {
+    
+      if( (tmp$EC.loess <= tmp$myCutoff)[r] == TRUE & (tmp$EC.loess <= tmp$myCutoff)[r-1] == FALSE ) {
+        linkageCount <- linkageCount + 1
+        }
+        
+      linkageByCutoff[r] <- linkageCount
+            
+      }
+    
+    linkageByCutoff <- unlist( linkageByCutoff )  
+    linkageByCutoff[ !(tmp$EC.loess <= tmp$myCutoff) ] <- 1
+    linkageByCutoff <- linkageByCutoff[ linkageByCutoff != 1 ]
+    Y <- ( table( table( linkageByCutoff ) ) )
+    X <- as.numeric( names( Y ) )
+    names(X) <- X
+    
+    pdf( kPaste( whereAmI, "figs/", datNames[i], "/NullLinkageAssessment.pdf" ) )
+    
+    print( barchart( Y ~ X, horizontal = FALSE,
+      xlab = "Length of linkage region",
+      ylab = "Count",
+      main = "Frequency and length of linkage regions in non-linkage sections",
+      sub = kPaste( "Window size: ", windowSize, ", madTuner: ", madTuner ),
+      scales = list( x = list( labels = names(X) ) )
+      ) )
+      
+    dev.off()
+  
+  }
+
+  ## Find the linkage points
+
+  linkagePoints <- with( kDat, which( EC.loess <= myCutoff ) )
+
+  ## isLinkage: 1 for non-linkage, 2 for linkage points, 3 for pseudo data
+
+  kDat$isLinkage <- 1
+  kDat$isLinkage[linkagePoints] <- 2
+
+  ## Check the lengths of the linkage regions; set those that are smaller than
+  ## minRegionLength to non-linkage.
+
+  kDat$linkageGroups <- 1
+
+  kDat$linkageGroups[ kDat$isLinkage == 2 ] <- as.numeric( (
+      as.factor( kDat$gp[ kDat$isLinkage == 2 ] )
+    ) ) + 1
+
+  faultyLinkage <- as.integer( names( with( subset( kDat, kDat$dataType == "Real" ),
+    table( linkageGroups )[ table( linkageGroups ) < minRegionLength ]
+    ) ) )
+
+  kDat$linkageGroups[ kDat$linkageGroups %in% faultyLinkage ] <- 1
+
+  kDat$isLinkage <- 1
+  kDat$isLinkage[ kDat$linkageGroups > 1 ] <- 2
+
+  ## Set isLinkage pseudo points to a different group for coloring
+
+  kDat$isLinkage[ kDat$dataType == "Pseudo" ] <- 3
+
+  kDat <- kDat[ order( kDat$posRank ), ] ## for line plotting
+
+  ## Plot the EC values: one internal, one supplement friendly
+  
+  if( nPseudo > 0 ) {
+    myCol <- c("#0080ff","red","grey")
+    } else {
+    myCol <- c("#0080ff", "red")
+    }
+  
+  pdf( kPaste( whereAmI, "figs/", datNames[i], "/ECvsPosition-", datNames[i], "-posRank-BarsAndLinkage.pdf" ),
+      width = 40, height = 8 )
+      
+  with( kDat,
+    print( useOuterStrips( xyplot( EC ~ posRank | chromoNum * arm, groups = isLinkage, layout = c(16,2), pch = ".", cex = 2,
+
+    as.table = TRUE,
+
+      panel = function(x,y,...) {
+        panel.grid( x = -1, y = -1 )
+        panel.xyplot( x, y, type = "p", alpha = 0.75, ... )
+        panel.xyplot( posRank[ gp == panel.number() ], EC.loess[ gp == panel.number() ], col = "darkgreen", type = "l" )
+        panel.abline( h = pMedian[panel.number()], col = "red" )
+        panel.abline( h = pLower[panel.number()], col = "orange" )
+        panel.abline( h = pUpper[panel.number()], col = "orange" )
+
+        if( any( kDat$isLinkage[ kDat$gp == packet.number() ] == 2 ) ) {
+          grid.text( "Linkage Found", y = 0.9 )
+          panel.abline( v = min( kDat$posRank[ kDat$gp == packet.number() & kDat$isLinkage == 2 ] ), lty = "dashed" )
+          panel.abline( v = max( kDat$posRank[ kDat$gp == packet.number() & kDat$isLinkage == 2 ] ), lty = "dashed" )
+
+          }
+
+        ## grid.text( paste("Length:", length(y) ), x = 0.7, y = 0.3 )
+        ## grid.text( paste("CalcWindow:", length(y) * kSpan[gp == panel.number()] ),
+        ##   x = 0.7, y = 0.1 )
+        ## grid.text( paste("Span:", kSpan[gp == panel.number()]), x = 0.7, y = 0.2 )
+
+        },
+
+      col = myCol,
+
+      main = "Position (actual distance) by Chromosome*Arm" )
+
+      ) ) )
+
+  dev.off()
+    
+  pdf( kPaste( whereAmI, "figs/", datNames[i], "/ECvsPosition-", datNames[i], "-posRank-BarsAndLinkage-supp.pdf" ),
+      width = 14, height = 7 )
+      
+  with( kDat,
+    print( useOuterStrips( xyplot( EC ~ posRank | chromoNum * arm, groups = isLinkage, layout = c(16,2),
+
+    as.table = TRUE, pch = 21, cex = 0.25, lty = 0.5, 
+    col = myCol,
+    
+    scales = list( 
+      relation = "free",
+      draw = FALSE 
+      ),
+      
+    axes = FALSE,
+      
+      panel = function(x,y,...) {
+        panel.grid( x = -1, y = -1 )
+        panel.xyplot( x, y, type = "p", ... )
+        panel.xyplot( posRank[ gp == panel.number() ], EC.loess[ gp == panel.number() ], col = "darkgreen", type = "l", lwd = 1  )
+        panel.abline( h = pMedian[panel.number()], col = "red" )
+        panel.abline( h = pLower[panel.number()], col = "orange" )
+        panel.abline( h = pUpper[panel.number()], col = "orange" )
+
+        if( any( kDat$isLinkage[ kDat$gp == packet.number() ] == 2 ) ) {
+          panel.abline( v = min( kDat$posRank[ kDat$gp == packet.number() & kDat$isLinkage == 2 ] ), lty = "dashed" )
+          panel.abline( v = max( kDat$posRank[ kDat$gp == packet.number() & kDat$isLinkage == 2 ] ), lty = "dashed" )
+
+          }
+
+        ## grid.text( paste("Length:", length(y) ), x = 0.7, y = 0.3 )
+        ## grid.text( paste("CalcWindow:", length(y) * kSpan[gp == panel.number()] ),
+        ##   x = 0.7, y = 0.1 )
+        ## grid.text( paste("Span:", kSpan[gp == panel.number()]), x = 0.7, y = 0.2 )
+
+        },
+
+      ## col = c("#0080ff","red","grey")
+      ## fill = c("#0080ff","red","grey"),
+      ## fill = c("skyblue", "red", "grey"),
+
+      main = "Position (actual distance) by Chromosome*Arm",
+      sub = "Axes suppressed - trend of smoother of interest only"
+      
+      ) ) ) )
+
+  dev.off()
+    
+  ## Zoom in on the linkage regions
+  
+  myWidthMultiplier <- length( linkageRegions[[ datNames[i] ]] )
+  
+  pdf( kPaste( whereAmI, "figs/", datNames[i], "/ECvsPosition-", datNames[i], "-posRank-BarsAndLinkage-ZoomIn.pdf" ),
+      width = 6+4*(myWidthMultiplier-1), height = 6 )
+
+  tmp <- subset( kDat, kDat$gpNice %in% linkageRegions[[ datNames[i] ]] )
+  cIndex <- which( names( pMedian ) %in% unique( tmp$gpNice ) )
+  
+  with( tmp,
+    print( ( xyplot( EC ~ posRank | gpNice, groups = isLinkage,
+    
+    
+      panel = function(x,y,...) {
+        panel.grid( x = -1, y = -1 )
+        panel.xyplot( x, y, type = "p", alpha = 0.75, ... )
+        panel.xyplot( posRank[tmp$gp == cIndex[panel.number()]], EC.loess[tmp$gp == cIndex[panel.number()]], col = "darkgreen", type = "l" )
+        panel.abline( h = pMedian[cIndex[panel.number()]], col = "red" )
+        panel.abline( h = pLower[cIndex[panel.number()]], col = "orange" )
+        panel.abline( h = pUpper[cIndex[panel.number()]], col = "orange" )
+
+       },
+
+      col = c("#0080ff","red","grey"),
+
+      main = "Position (actual distance) by Chromosome*Arm" )
+
+      ) ) )
+
+  dev.off()
+    
+  ## Plot the EC values colored by p-value cutoff
+  
+  pdf( kPaste( whereAmI, "figs/", datNames[i], "/ECvsPosition-", datNames[i], "-posRank-pValCutoff.pdf" ),
+      width = 40, height = 10 )
+
+  with( subset( kDat, isLinkage == 1 ),
+    print( ( xyplot( EC ~ posRank | gpNice, groups = Pval <= pValCutoff, layout = c(16,2),
+
+    as.table = TRUE,
+
+      panel = function(x,y,...) {
+        panel.grid( x = -1, y = -1 )
+        panel.xyplot( x, y, type = "p", ... )
+        },
+
+      col = c("#0080ff","red","grey"),
+
+      main = "Position (actual distance) by Chromosome*Arm" )
+
+      ) ) )
+
+  dev.off()
+
+  ## Log file output
+
+  sink( kPaste( whereAmI, "dataSummary/", datNames[i], "-log.txt" ) )
+
+  cat("The parameters of interest chosen as follows:\n\n")
+  print( theParams )
+  cat("
+  windowSize - denotes the size of a window.
+  madTuner - tunes the size of the cutoff bands: higher = more strict. Ie, multiply the MAD by this value.
+  chromoArmWeight - weighs the chromoArm median vs. the overall median
+  nPseudo - controls the number of pseudo-data points (for boundary help)
+  percentPseudo - add / remove extra data for larger chromoArms?
+  minRegion - what is the minimum length required for something to be called linkage?
+  " )
+
+  cat("\n\nRegion locations and lengths:\n\n")
+  with( subset( kDat, isLinkage == 2 ), cat( unique( as.character( gpNice ) ) ) )
+  cat("\n")
+  with( subset( kDat, isLinkage == 2 ), cat( tapply( EC, linkageGroups, length ) ) )
+  
+  cat("\n\nWhat is the linkage cutoff for each arm?\n\n")
+  tmp <- with( kDat, tapply( myCutoff, gpNice, function(x) { x[1] } ) )
+  print( data.frame( chromoArm = names( tmp ), cutoff = tmp ), row.names = F ) 
+  
+  cat("\n\nWhat are the actual genes identified as linkage?\n\n")
+  with( subset( kDat, isLinkage == 2 ), cat( sort( as.character(ORF) ) ) )
+  
+  cat("\n\nWhich genes meet the Pval cutoff?\n\n")
+  with( subset( kDat, isLinkage == 1 ), cat( sort( as.character( ORF[ Pval <= pValCutoff ] ) ) ) )
+  
+  cat("\n\nThe genes that meet the Pval cutoff, sorted by their EC magnitude.\n\n")
+  tmp <- subset( kDat, isLinkage == 1 & Pval <= pValCutoff )
+  rownames(tmp) <- NULL
+  print( tmp[ order( tmp$EC ), ][c("ORF","EC","Pval")] )
+  
+  ## Print the genes that meet Pval cutoff and aren't in the linkage region
+  
+  write.table( tmp[ order( tmp$EC ), ][c("ORF","EC","Pval")],
+    file = kPaste( whereAmI, "outputData/", datNames[i], "/", datNames[i], "-meetsPVal.csv" ),
+    row.names = F, sep = "," )
+
+  sink()
+
+  ## Rename the variables to be more informative
+
+  kDat$isLinkage[ kDat$isLinkage == 1 ] <- "No"
+  kDat$isLinkage[ kDat$isLinkage == 2 ] <- "Yes"
+  kDat$isLinkage[ kDat$isLinkage == 3 ] <- "Pseudo"
+  
+  ## Print out the linkage genes to their own file.
+  write.csv( kDat[ kDat$isLinkage == "Yes", ][c("ORF","gpNice","EC.loess","myCutoff")], 
+    file = kPaste( whereAmI, "outputData/", datNames[i], "/", datNames[i], "-linkageGenes.csv" ),
+    row.names = FALSE )
+
+  all( kDat$isLinkage[ kDat$isLinkage == 3 ] == kDat$dataType[ kDat$isLinkage == 3 ] )
+
+  write.csv( kDat[ order( kDat$gpNice ), ], file = kPaste( whereAmI, "outputData/", datNames[i], "/", datNames[i], "-processed.csv" ),
+    row.names = FALSE )
+
+}
+
+cat( kPaste( "Complete! Navigate to ", gsub( "\\\\", "/", whereAmI ), " to find the project output.\n\n" ) )  
